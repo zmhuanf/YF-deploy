@@ -146,17 +146,18 @@ class ServerPage(QWidget):
     """服务器列表页 右键新建 复制连接指令 编辑 删除"""
 
     changed = Signal()
+    open_requested = Signal(object)
 
     def __init__(self, store: Store, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.store = store
 
-        hint = QLabel("右键空白处新建服务器；右键某台服务器可复制 SSH / pi 启动指令")
+        hint = QLabel("双击服务器进入文件管理；右键可新建、复制连接指令、编辑、删除")
         hint.setStyleSheet("color:#6b7280;padding:8px 12px;")
 
         self.view = make_card_view()
         self.view.customContextMenuRequested.connect(self._context_menu)
-        self.view.itemDoubleClicked.connect(lambda _: self._edit_current())
+        self.view.itemDoubleClicked.connect(lambda _: self._open_current())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -230,11 +231,11 @@ class ServerPage(QWidget):
         self.store.upsert_server(dialog.result_server())
         self._commit()
 
-    def _edit_current(self) -> None:
-        """双击卡片进入编辑"""
+    def _open_current(self) -> None:
+        """双击卡片进入远端文件管理器"""
         server = self.store.server(self.view.currentIndex().data(ROLE_KEY))
         if server is not None:
-            self._edit(server)
+            self.open_requested.emit(server)
 
     def _delete(self, server: Server) -> None:
         """二次确认后删除 引用它的项目保留但需要重新选服务器"""

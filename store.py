@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / ".data"
+
+# 数据目录可用环境变量改写 测试时指向临时目录 避免动到真实配置
+DATA_DIR_ENV = "YF_DEPLOY_DATA_DIR"
 
 
 @dataclass(slots=True)
@@ -82,10 +86,11 @@ def _dump(path: Path, items: list) -> None:
 class Store:
     """servers.json 与 projects.json 的读写入口"""
 
-    def __init__(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.servers_file = DATA_DIR / "servers.json"
-        self.projects_file = DATA_DIR / "projects.json"
+    def __init__(self, data_dir: Path | None = None) -> None:
+        root = Path(data_dir or os.environ.get(DATA_DIR_ENV) or DATA_DIR)
+        root.mkdir(parents=True, exist_ok=True)
+        self.servers_file = root / "servers.json"
+        self.projects_file = root / "projects.json"
         self.servers: list[Server] = _load(self.servers_file, Server)
         self.projects: list[Project] = _load(self.projects_file, Project)
 

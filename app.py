@@ -15,9 +15,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from browser_page import BrowserPage
 from project_page import ProjectPage
 from server_page import ServerPage
-from store import Store
+from store import Server, Store
 
 APP_QSS = """
 QListWidget#nav {
@@ -72,13 +73,18 @@ class MainWindow(QMainWindow):
 
         self.server_page = ServerPage(self.store)
         self.project_page = ProjectPage(self.store)
+        self.browser_page = BrowserPage()
         for title, page in zip(NAV_ITEMS, (self.server_page, self.project_page)):
             self.nav.addItem(QListWidgetItem(title))
             self.pages.addWidget(page)
+        self.pages.addWidget(self.browser_page)
 
-        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+        self.nav.itemClicked.connect(self._on_nav_clicked)
         self.nav.setCurrentRow(0)
         self.server_page.changed.connect(self.project_page.refresh)
+        self.server_page.open_requested.connect(self._open_browser)
+        self.browser_page.closed.connect(self._back_to_list)
         self.statusBar().showMessage("就绪")
 
         body = QWidget()
@@ -88,6 +94,27 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.nav)
         layout.addWidget(self.pages, 1)
         self.setCentralWidget(body)
+
+    def _open_browser(self, server: Server) -> None:
+        """双击服务器进入远端文件管理器"""
+        self.pages.setCurrentWidget(self.browser_page)
+        self.browser_page.open_server(server)
+
+    def _back_to_list(self) -> None:
+        """从文件管理器返回服务器列表"""
+        self.browser_page.close_session()
+        self.nav.setCurrentRow(0)
+        self.pages.setCurrentIndex(0)
+
+    def _on_nav_changed(self, row: int) -> None:
+        """切换导航时收起文件管理器并断开连接"""
+        if self.pages.currentWidget() is self.browser_page:
+            self.browser_page.close_session()
+        self.pages.setCurrentIndex(row)
+
+    def _on_nav_clicked(self, item: QListWidgetItem) -> None:
+        """点已选中的导航项也要能离开文件管理器"""
+        self._on_nav_changed(self.nav.row(item))
 
 
 def main() -> int:

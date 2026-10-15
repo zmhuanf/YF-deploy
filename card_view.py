@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QRect, QRectF, QSize, Qt
+from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
-from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QListWidget, QListView, QStyle, QStyledItemDelegate, QWidget
+
+import icons
 
 ROLE_ICON = Qt.ItemDataRole.UserRole + 1
 ROLE_TITLE = Qt.ItemDataRole.UserRole + 2
@@ -31,21 +32,6 @@ COLOR_ICON = "#64748b"
 COLOR_ICON_SELECT = "#1e90ff"
 COLOR_BADGE_BG = "#eef2f7"
 COLOR_BADGE_TEXT = "#64748b"
-
-# 图标是内嵌 SVG 描边图形 用 {color} 占位符实现按状态换色
-ICONS = {
-    "server": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}"'
-        ' stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
-        '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/>'
-        '<path d="M7 7.5h.01M7 16.5h.01"/></svg>'
-    ),
-    "project": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}"'
-        ' stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
-        '<path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.3a2 2 0 0 1 1.7.9l1.1 1.6h7.9A2.5 2.5 0 0 1 21 9v8.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>'
-    ),
-}
 
 
 def make_card_view(parent: QWidget | None = None) -> QListWidget:
@@ -155,20 +141,10 @@ class CardDelegate(QStyledItemDelegate):
         color = COLOR_ICON_SELECT if selected else COLOR_ICON
         ratio = widget.devicePixelRatioF() if widget else 1.0
         cached = self._icons.get((key, color, ratio))
-        if cached is not None:
-            return cached
-
-        pixels = round(ICON_SIZE * ratio)
-        pixmap = QPixmap(pixels, pixels)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        svg = ICONS.get(key, ICONS["server"]).format(color=color)
-        QSvgRenderer(QByteArray(svg.encode())).render(painter, QRectF(0, 0, pixels, pixels))
-        painter.end()
-        pixmap.setDevicePixelRatio(ratio)
-        self._icons[(key, color, ratio)] = pixmap
-        return pixmap
+        if cached is None:
+            cached = icons.render(key, color, ICON_SIZE, ratio)
+            self._icons[(key, color, ratio)] = cached
+        return cached
 
     @staticmethod
     def _measure_badge(base: QFont, badge: str) -> int:
