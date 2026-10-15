@@ -1,0 +1,6 @@
+# 本机数据 含明文密码 禁止提交
+.data/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
