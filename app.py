@@ -44,7 +44,7 @@ QListWidget#cards {
     border: none;
     outline: none;
 }
-QPlainTextEdit#log {
+QPlainTextEdit#log, QPlainTextEdit#viewer {
     background: #1e1f22;
     color: #d7dae0;
     font-family: Consolas, "Courier New", monospace;

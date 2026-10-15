@@ -9,9 +9,10 @@ from pathlib import Path
 
 import paramiko
 from PySide6.QtCore import QRect, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QStyle,
@@ -41,6 +43,38 @@ SORT_FIELDS = (("名称", "name"), ("大小", "size"), ("修改时间", "mtime")
 COLOR_FOLDER = "#eab308"
 COLOR_FILE = "#64748b"
 COLOR_SELECT = "#1e90ff"
+
+# 探测文件类型时读取的开头字节数
+PROBE_BYTES = 4096
+
+# 扩展名能直接判定的走白名单 其余读开头字节探测
+TEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".log", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf",
+    ".env", ".properties", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".ps1", ".sql", ".csv",
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".vue", ".java", ".go", ".rs", ".rb", ".php", ".lua",
+    ".c", ".h", ".cpp", ".hpp", ".cs", ".swift", ".kt", ".scala", ".pl",
+    ".xml", ".html", ".htm", ".css", ".scss", ".less", ".svg",
+}
+
+BINARY_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff", ".psd",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".dat", ".db", ".sqlite", ".pyc", ".pyo",
+    ".class", ".o", ".a", ".lib", ".obj", ".pdb", ".whl", ".deb", ".rpm", ".msi",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf",
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".avi", ".mkv", ".mov", ".wmv",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot", ".iso", ".img", ".apk", ".ipa",
+}
+
+
+def text_kind(name: str) -> str:
+    """按扩展名给出 text / binary / unknown"""
+    suffix = Path(name).suffix.lower()
+    if suffix in TEXT_SUFFIXES:
+        return "text"
+    if suffix in BINARY_SUFFIXES:
+        return "binary"
+    return "unknown"
 
 
 def format_size(size: int) -> str:
@@ -131,6 +165,110 @@ class FileView(QListWidget):
             event.acceptProposedAction()
 
 
+class TextViewDialog(QDialog):
+    """只读展示远端文本内容 支持刷新与跳到末尾"""
+
+    def __init__(self, parent: QWidget | None, client: paramiko.SSHClient, entry: RemoteEntry, kind: str, text: str, truncated: bool) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._entry = entry
+        self._kind = kind
+        self._worker: TextWorker | None = None
+        self._truncated = truncated
+        self._origin = "开头"
+
+        self.setWindowTitle(f"文本预览 - {entry.name}")
+        self.resize(920, 660)
+
+        header = QLabel(f"{entry.path}　{format_size(entry.size)}")
+        header.setStyleSheet("color:#6b7280;padding:2px 0 8px 2px;")
+
+        self.viewer = QPlainTextEdit()
+        self.viewer.setObjectName("viewer")
+        self.viewer.setReadOnly(True)
+        self.viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        self.footer = QLabel()
+        self.footer.setStyleSheet("color:#6b7280;padding:6px 2px 0 2px;")
+
+        self.refresh_button = QPushButton("刷新")
+        self.refresh_button.clicked.connect(lambda: self._load(False))
+        self.tail_button = QPushButton(f"最后 {ssh.TEXT_LINE_LIMIT} 行")
+        self.tail_button.clicked.connect(lambda: self._load(True))
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.footer, 1)
+        bottom.addWidget(self.refresh_button)
+        bottom.addWidget(self.tail_button)
+        bottom.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(header)
+        layout.addWidget(self.viewer, 1)
+        layout.addLayout(bottom)
+
+        self._show(text, truncated, self._origin)
+
+    def closeEvent(self, event) -> None:
+        """关闭前停掉读取线程 避免线程随对象一起被销毁"""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(3000)
+        self._worker = None
+        super().closeEvent(event)
+
+    def _load(self, tail: bool) -> None:
+        """重新从服务器读取 尾部模式取文件末尾"""
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self.refresh_button.setEnabled(False)
+        self.tail_button.setEnabled(False)
+        self.footer.setText("正在读取…")
+        worker = TextWorker(self._client, self._entry, self._kind, tail, self)
+        worker.loaded.connect(self._show)
+        worker.rejected.connect(self._reject)
+        worker.failed.connect(self._fail)
+        worker.finished.connect(lambda: self._release(worker))
+        self._worker = worker
+        worker.start()
+
+    def _show(self, text: str, truncated: bool, origin: str) -> None:
+        """把内容放进查看器并按来源把光标落到开头或末尾"""
+        self.viewer.setPlainText(text)
+        self._truncated = truncated
+        self._origin = origin
+        self.viewer.moveCursor(QTextCursor.MoveOperation.End if origin == "末尾" else QTextCursor.MoveOperation.Start)
+        self._update_note()
+
+    def _update_note(self) -> None:
+        """更新底部的行数与位置提示"""
+        note = f"共 {len(self.viewer.toPlainText().splitlines())} 行"
+        if self._origin == "末尾":
+            note += "　（显示文件末尾，前面还有内容）" if self._truncated else "　（显示文件末尾）"
+        elif self._truncated:
+            note += "　（文件较大 只显示开头部分）"
+        self.footer.setText(note)
+
+    def _release(self, worker: TextWorker) -> None:
+        """读取结束后解除引用并恢复按钮"""
+        if self._worker is worker:
+            self._worker = None
+        worker.deleteLater()
+        self.refresh_button.setEnabled(True)
+        self.tail_button.setEnabled(True)
+
+    def _reject(self, message: str) -> None:
+        """内容判定为二进制"""
+        self.footer.setText(message)
+
+    def _fail(self, message: str) -> None:
+        """读取失败"""
+        self.footer.setText(f"读取失败：{message}")
+        QMessageBox.warning(self, "读取失败", message)
+
+
 class ListWorker(QThread):
     """后台建立连接并读取远端目录"""
 
@@ -162,6 +300,45 @@ class ListWorker(QThread):
             self.loaded.emit(self.client, target, entries)
         except Exception as error:
             self.failed.emit(self.client, str(error))
+
+
+class TextWorker(QThread):
+    """后台读取远端文件内容用于文本预览"""
+
+    loaded = Signal(str, bool, str)
+    rejected = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, client: paramiko.SSHClient, entry: RemoteEntry, kind: str, tail: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.client = client
+        self.entry = entry
+        self.kind = kind
+        self.tail = tail
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        """请求中断 结果由会话号拦掉"""
+        self._stop.set()
+
+    def run(self) -> None:
+        """读取文件 开头模式对未知类型先做字节探测"""
+        try:
+            with self.client.open_sftp() as sftp:
+                if self._stop.is_set():
+                    return
+                if self.tail:
+                    text, more = ssh.read_tail(sftp, self.entry.path)
+                else:
+                    if self.kind == "unknown" and not ssh.looks_like_text(ssh.read_head(sftp, self.entry.path, PROBE_BYTES)):
+                        self.rejected.emit(f"{self.entry.name} 不是文本文件，无法预览")
+                        return
+                    text, more = ssh.read_text(sftp, self.entry.path)
+            if not self._stop.is_set():
+                self.loaded.emit(text, more, "末尾" if self.tail else "开头")
+        except Exception as error:
+            if not self._stop.is_set():
+                self.failed.emit(str(error))
 
 
 class TransferWorker(QThread):
@@ -292,6 +469,7 @@ class BrowserPage(QWidget):
         self._session = 0
         self._list_worker: ListWorker | None = None
         self._transfer: TransferWorker | None = None
+        self._reader: TextWorker | None = None
         self._last_local_dir = ""
         self._build_ui()
 
@@ -369,7 +547,7 @@ class BrowserPage(QWidget):
     def close_session(self) -> None:
         """断开连接并清空界面 旧会话的回调会被丢弃"""
         self._session += 1
-        for worker in (self._list_worker, self._transfer):
+        for worker in (self._list_worker, self._transfer, self._reader):
             if worker is not None and worker.isRunning():
                 worker.stop()
         if self._client is not None:
@@ -485,14 +663,57 @@ class BrowserPage(QWidget):
             self._load(self.remote_dir)
 
     def _activate(self, item: QListWidgetItem) -> None:
-        """双击文件夹进入 双击文件直接下载到上次用过的目录"""
+        """双击文件夹进入目录 双击文件按文本预览"""
         entry: RemoteEntry | None = item.data(ENTRY_ROLE)
         if entry is None:
             return
         if entry.is_dir:
             self._load(entry.path)
             return
-        self._download([entry], ask=False)
+        self._preview(entry)
+
+    def _preview(self, entry: RemoteEntry) -> None:
+        """读取远端文件并按文本弹窗展示"""
+        if self._client is None:
+            QMessageBox.warning(self, "未连接", "当前没有可用的服务器连接")
+            return
+        if self._reader is not None and self._reader.isRunning():
+            return
+        kind = text_kind(entry.name)
+        if kind == "binary":
+            QMessageBox.information(self, "无法预览", f"{entry.name} 不是文本文件")
+            return
+        worker = TextWorker(self._client, entry, kind, self)
+        worker.loaded.connect(lambda text, truncated, origin: self._show_text(entry, kind, text, truncated))
+        worker.rejected.connect(self._show_rejected)
+        worker.failed.connect(self._on_preview_failed)
+        worker.finished.connect(lambda: self._release_reader(worker))
+        self._reader = worker
+        self._set_status(f"正在读取 {entry.name} …")
+        worker.start()
+
+    def _show_text(self, entry: RemoteEntry, kind: str, text: str, truncated: bool) -> None:
+        """弹出文本预览窗口"""
+        if self.server is None or self._client is None:
+            return
+        self._set_status(f"{entry.name}｜{entry.path}")
+        TextViewDialog(self, self._client, entry, kind, text, truncated).exec()
+
+    def _show_rejected(self, message: str) -> None:
+        """内容探测判定为二进制时的提示"""
+        self._set_status(message)
+        QMessageBox.information(self, "无法预览", message)
+
+    def _on_preview_failed(self, message: str) -> None:
+        """预览读取失败"""
+        self._set_status(f"读取失败：{message}")
+        QMessageBox.warning(self, "读取失败", message)
+
+    def _release_reader(self, worker: TextWorker) -> None:
+        """读取结束后解除引用再释放 避免访问已删除的对象"""
+        if self._reader is worker:
+            self._reader = None
+        worker.deleteLater()
 
     def _context_menu(self, pos) -> None:
         """按点击位置弹出菜单 命中条目与命中空白处菜单不同"""
@@ -541,16 +762,13 @@ class BrowserPage(QWidget):
             case "copy-here":
                 self._copy(self.remote_dir)
 
-    def _download(self, entries: list[RemoteEntry], ask: bool = True) -> None:
-        """下载条目 双击走记忆目录 右键每次弹选择框"""
+    def _download(self, entries: list[RemoteEntry]) -> None:
+        """选保存目录后把远端条目下载过去"""
         if not entries or not self._ready():
             return
-        target = self._last_local_dir
-        if ask or not target:
-            chosen = QFileDialog.getExistingDirectory(self, "选择保存目录", target)
-            if not chosen:
-                return
-            target = chosen
+        target = QFileDialog.getExistingDirectory(self, "选择保存目录", self._last_local_dir)
+        if not target:
+            return
         self._last_local_dir = target
         self._run_transfer(DownloadWorker(self._client, entries, Path(target), self), "下载")
 

@@ -19,6 +19,10 @@ POLL_INTERVAL = 0.05
 # 需要补可执行位的后缀 无后缀的脚本文件同样补
 EXECUTABLE_SUFFIXES = ("", ".sh")
 
+# 文本预览最多回传的字节数与行数
+TEXT_BYTE_LIMIT = 1024 * 1024
+TEXT_LINE_LIMIT = 5000
+
 # 单文件传输进度回调 参数为 文件名 已传字节 总字节
 ProgressHook = Callable[[str, int, int], None]
 
@@ -97,6 +101,64 @@ def scan_tree(sftp: paramiko.SFTPClient, remote: str) -> tuple[int, int]:
         files += 1
         total += attr.st_size or 0
     return files, total
+
+
+def read_head(sftp: paramiko.SFTPClient, remote: str, size: int) -> bytes:
+    """读取远端文件开头的若干字节 用来判断是不是文本"""
+    with sftp.open(remote, "rb") as handle:
+        return handle.read(size)
+
+
+def looks_like_text(head: bytes) -> bool:
+    """按开头字节判断是否为文本 出现 NUL 或控制字符过多就当成二进制"""
+    if not head:
+        return True
+    if b"\0" in head:
+        return False
+    allowed = {9, 10, 12, 13}
+    control = sum(1 for byte in head if byte < 32 and byte not in allowed)
+    return control / len(head) < 0.05
+
+
+def read_text(sftp: paramiko.SFTPClient, remote: str, byte_limit: int = TEXT_BYTE_LIMIT, line_limit: int = TEXT_LINE_LIMIT) -> tuple[str, bool]:
+    """读取远端文件开头部分并解码 返回文本与是否被截断"""
+    with sftp.open(remote, "rb") as handle:
+        raw = handle.read(byte_limit + 1)
+    truncated = len(raw) > byte_limit
+    lines = decode_text(raw[:byte_limit]).splitlines()
+    if len(lines) > line_limit:
+        return "\n".join(lines[:line_limit]), True
+    return "\n".join(lines), truncated
+
+
+def decode_text(raw: bytes) -> str:
+    """按 UTF-8 GB18030 的顺序尝试解码 被截断的尾部残缺字节直接丢掉"""
+    for trim in (0, 1, 2, 3):
+        try:
+            return raw[: len(raw) - trim].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    try:
+        return raw.decode("gb18030")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace")
+
+
+def read_tail(sftp: paramiko.SFTPClient, remote: str, byte_limit: int = TEXT_BYTE_LIMIT, line_limit: int = TEXT_LINE_LIMIT) -> tuple[str, bool]:
+    """读取远端文件末尾部分并解码 返回文本与前面是否还有内容"""
+    offset = max(0, sftp.stat(remote).st_size - byte_limit)
+    with sftp.open(remote, "rb") as handle:
+        if offset:
+            handle.seek(offset)
+        raw = handle.read(byte_limit)
+    if offset:
+        # 从中间切进去的首行往往不完整 丢掉
+        first_break = raw.find(b"\n")
+        raw = raw[first_break + 1 :] if first_break >= 0 else raw
+    lines = decode_text(raw).splitlines()
+    if len(lines) > line_limit:
+        return "\n".join(lines[-line_limit:]), True
+    return "\n".join(lines), offset > 0
 
 
 def download_file(sftp: paramiko.SFTPClient, remote: str, local: Path, on_bytes: ProgressHook | None = None) -> None:
