@@ -7,6 +7,7 @@ import re
 import stat
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,9 @@ POLL_INTERVAL = 0.05
 
 # 需要补可执行位的后缀 无后缀的脚本文件同样补
 EXECUTABLE_SUFFIXES = ("", ".sh")
+
+# 上传中转文件的后缀 内核禁止覆盖正在运行的可执行文件 只能先写中转名再改名
+TEMP_SUFFIX = ".yf-tmp"
 
 # 文本预览最多回传的字节数与行数
 TEXT_BYTE_LIMIT = 1024 * 1024
@@ -320,11 +324,29 @@ def run_command(
 
 
 def _put_file(sftp: paramiko.SFTPClient, local: Path, remote: str, os_type: str, on_bytes: ProgressHook | None = None) -> None:
-    """上传单个文件 按目标系统类型决定是否补可执行位"""
+    """上传单个文件到中转名再改名顶替目标 直接覆盖运行中的可执行文件会被内核拒绝"""
+    temp = f"{remote}{TEMP_SUFFIX}"
     callback = (lambda done, total: on_bytes(local.name, done, total)) if on_bytes else None
-    sftp.put(str(local), remote, callback=callback, confirm=False)
-    if os_type == "linux" and local.suffix in EXECUTABLE_SUFFIXES:
-        mark_executable(sftp, remote)
+    try:
+        sftp.put(str(local), temp, callback=callback, confirm=False)
+        if os_type == "linux" and local.suffix in EXECUTABLE_SUFFIXES:
+            mark_executable(sftp, temp)
+        _replace_file(sftp, temp, remote)
+    except Exception:
+        # 失败时清掉中转文件 避免远端留下垃圾
+        with suppress(OSError):
+            sftp.remove(temp)
+        raise
+
+
+def _replace_file(sftp: paramiko.SFTPClient, temp: str, remote: str) -> None:
+    """用中转文件顶替目标 老服务端不支持 posix 改名时退回先删后改名"""
+    try:
+        sftp.posix_rename(temp, remote)
+    except (OSError, paramiko.SSHException):
+        if exists(sftp, remote):
+            sftp.remove(remote)
+        sftp.rename(temp, remote)
 
 
 def _make_dirs(sftp: paramiko.SFTPClient, path: str) -> None:
