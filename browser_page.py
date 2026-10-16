@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -94,6 +95,21 @@ def entry_tooltip(entry: RemoteEntry) -> str:
         rows.append(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.mtime)))
     rows.append(entry.path)
     return "\n".join(rows)
+
+
+# Windows 远端文件名里不允许出现的字符
+WINDOWS_BAD_CHARS = '\\:*?"<>|'
+
+
+def invalid_name_reason(name: str, os_type: str) -> str:
+    """条目名不合法时给出原因 合法返回空串"""
+    if not name:
+        return "名称不能为空"
+    if name in (".", ".."):
+        return "名称不能是 . 或 .."
+    bad = ("/" + WINDOWS_BAD_CHARS) if os_type == "windows" else "/"
+    hit = next((char for char in bad if char in name), "")
+    return f"名称不能包含 {hit}" if hit else ""
 
 
 class FileDelegate(QStyledItemDelegate):
@@ -381,6 +397,44 @@ class TransferWorker(QThread):
         return text
 
 
+class FileCmdWorker(QThread):
+    """在远端逐条执行文件命令 每条完成推一格进度"""
+
+    progress = Signal(int, int, str)
+    done = Signal(bool, str)
+
+    def __init__(self, client: paramiko.SSHClient, jobs: list[tuple[str, str]], title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.client = client
+        self.jobs = jobs
+        self.title = title
+        self._stop = threading.Event()
+        self._failures: list[str] = []
+
+    def stop(self) -> None:
+        """请求中断 正在跑的那条命令会一并被抢断"""
+        self._stop.set()
+
+    def run(self) -> None:
+        """逐条执行命令 单项失败不影响其余"""
+        total = len(self.jobs)
+        for index, (name, command) in enumerate(self.jobs):
+            self.progress.emit(index, total, name)
+            output: list[str] = []
+            code = ssh.run_command(self.client, command, output.append, self._stop.is_set)
+            if code == -1:
+                self.done.emit(False, f"{self.title}已取消")
+                return
+            if code != 0:
+                detail = " ".join("".join(output).split())[:80] or f"退出码 {code}"
+                self._failures.append(f"{name}（{detail}）")
+        self.progress.emit(total, total, self.title)
+        message = f"{self.title}完成 共 {total} 项"
+        if self._failures:
+            message += f"  {len(self._failures)} 项失败：" + "；".join(self._failures[:3])
+        self.done.emit(not self._failures, message)
+
+
 class DownloadWorker(TransferWorker):
     """把远端条目下载到本地目录"""
 
@@ -470,6 +524,9 @@ class BrowserPage(QWidget):
         self._list_worker: ListWorker | None = None
         self._transfer: TransferWorker | None = None
         self._reader: TextWorker | None = None
+        self._cmd: FileCmdWorker | None = None
+        self._clip_entries: list[RemoteEntry] = []
+        self._clip_cut = False
         self._last_local_dir = ""
         self._build_ui()
 
@@ -547,7 +604,7 @@ class BrowserPage(QWidget):
     def close_session(self) -> None:
         """断开连接并清空界面 旧会话的回调会被丢弃"""
         self._session += 1
-        for worker in (self._list_worker, self._transfer, self._reader):
+        for worker in (self._list_worker, self._transfer, self._reader, self._cmd):
             if worker is not None and worker.isRunning():
                 worker.stop()
         if self._client is not None:
@@ -556,6 +613,8 @@ class BrowserPage(QWidget):
         self.server = None
         self.remote_dir = ""
         self._entries.clear()
+        self._clip_entries.clear()
+        self._clip_cut = False
         self.view.clear()
         self.path_edit.clear()
         self._set_toolbar_enabled(True)
@@ -721,7 +780,11 @@ class BrowserPage(QWidget):
         menu = QMenu(self)
         if item is None:
             self.view.clearSelection()
+            menu.addAction("新建文件夹").setData("mkdir")
             menu.addAction("上传文件").setData("upload")
+            paste = menu.addAction("粘贴")
+            paste.setData("paste")
+            paste.setEnabled(bool(self._clip_entries))
             menu.addSeparator()
             menu.addAction("复制当前文件夹路径").setData("copy-here")
             menu.addAction("刷新").setData("refresh")
@@ -741,26 +804,183 @@ class BrowserPage(QWidget):
                 menu.addSeparator()
                 menu.addAction("复制文件路径").setData("copy-path")
             menu.addAction("复制所在文件夹路径").setData("copy-parent")
+            menu.addSeparator()
+            rename = menu.addAction("重命名")
+            rename.setData("rename")
+            rename.setEnabled(len(entries) == 1)
+            menu.addAction("删除").setData("delete")
+            menu.addAction("复制").setData("copy")
+            menu.addAction("剪切").setData("cut")
+            paste = menu.addAction("粘贴")
+            paste.setData("paste")
+            paste.setEnabled(bool(self._clip_entries))
 
         action = menu.exec(self.view.viewport().mapToGlobal(pos))
         if action is None:
             return
         entries = self._selected_entries()
         match action.data():
+            case "mkdir":
+                self._make_folder()
             case "upload":
                 self._pick_upload()
+            case "paste":
+                self._paste()
             case "refresh":
                 self._reload()
             case "open" if entries:
                 self._load(entries[0].path)
             case "download":
                 self._download(entries)
+            case "rename" if entries:
+                self._rename(entries[0])
+            case "delete" if entries:
+                self._delete(entries)
+            case "copy" if entries:
+                self._set_clip(entries, False)
+            case "cut" if entries:
+                self._set_clip(entries, True)
             case "copy-path" if entries:
                 self._copy("\n".join(entry.path for entry in entries))
             case "copy-parent" if entries:
                 self._copy(posixpath.dirname(entries[0].path))
             case "copy-here":
                 self._copy(self.remote_dir)
+
+    def _make_folder(self) -> None:
+        """在当前目录新建文件夹"""
+        if not self._ready():
+            return
+        name, accepted = QInputDialog.getText(self, "新建文件夹", "文件夹名称：")
+        if not accepted:
+            return
+        name = name.strip()
+        reason = invalid_name_reason(name, self.server.os_type)
+        if reason:
+            QMessageBox.warning(self, "名称无效", reason)
+            return
+        target = posixpath.join(self.remote_dir, name)
+        try:
+            with self._client.open_sftp() as sftp:
+                sftp.mkdir(target)
+        except Exception as error:
+            QMessageBox.warning(self, "新建失败", str(error))
+            return
+        self._set_status(f"已新建文件夹 {target}")
+        self._reload()
+
+    def _rename(self, entry: RemoteEntry) -> None:
+        """给单个条目改名 目标已存在时拒绝"""
+        if not self._ready():
+            return
+        name, accepted = QInputDialog.getText(self, "重命名", "新名称：", text=entry.name)
+        if not accepted:
+            return
+        name = name.strip()
+        if name == entry.name:
+            return
+        reason = invalid_name_reason(name, self.server.os_type)
+        if reason:
+            QMessageBox.warning(self, "名称无效", reason)
+            return
+        target = posixpath.join(posixpath.dirname(entry.path), name)
+        try:
+            with self._client.open_sftp() as sftp:
+                if ssh.exists(sftp, target):
+                    QMessageBox.warning(self, "重命名失败", f"{name} 已存在")
+                    return
+                sftp.rename(entry.path, target)
+        except Exception as error:
+            QMessageBox.warning(self, "重命名失败", str(error))
+            return
+        self._set_status(f"已重命名为 {target}")
+        self._reload()
+
+    def _delete(self, entries: list[RemoteEntry]) -> None:
+        """确认后删除选中条目 走远端删除命令 没有回收站"""
+        if not entries or not self._ready():
+            return
+        names = "、".join(entry.name for entry in entries[:3])
+        if len(entries) > 3:
+            names += f" 等 {len(entries)} 项"
+        answer = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除 {names}？删除后无法恢复",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        jobs = [(entry.name, ssh.remove_command(entry.path, entry.is_dir, self.server.os_type)) for entry in entries]
+        self._run_commands("删除", jobs)
+
+    def _set_clip(self, entries: list[RemoteEntry], cut: bool) -> None:
+        """把选中条目放进远端剪贴板 粘贴只会落在远端目录"""
+        self._clip_entries = list(entries)
+        self._clip_cut = cut
+        self._set_status(f"已{'剪切' if cut else '复制'} {len(entries)} 项 进入目标目录后粘贴")
+
+    def _paste(self) -> None:
+        """把剪贴板条目复制或移动到当前目录 同名直接覆盖"""
+        if not self._clip_entries or not self._ready():
+            return
+        os_type = self.server.os_type
+        jobs: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        try:
+            with self._client.open_sftp() as sftp:
+                for entry in self._clip_entries:
+                    target = posixpath.join(self.remote_dir, entry.name)
+                    if not ssh.exists(sftp, entry.path):
+                        skipped.append(f"{entry.name}（源已不存在）")
+                    elif target == entry.path:
+                        skipped.append(f"{entry.name}（已在当前目录）")
+                    elif entry.is_dir and target.startswith(entry.path.rstrip("/") + "/"):
+                        skipped.append(f"{entry.name}（不能放进它自己里面）")
+                    else:
+                        jobs.append((entry.name, ssh.paste_command(entry.path, entry.is_dir, target, os_type, self._clip_cut)))
+        except Exception as error:
+            QMessageBox.warning(self, "粘贴失败", str(error))
+            return
+        if not jobs:
+            QMessageBox.information(self, "无法粘贴", "没有可粘贴的项：" + "；".join(skipped[:3]))
+            return
+        if self._clip_cut and not skipped:
+            # 剪切的内容已全部排上队 剪贴板没必要留着
+            self._clip_entries = []
+            self._clip_cut = False
+        self._run_commands("粘贴", jobs)
+
+    def _run_commands(self, title: str, jobs: list[tuple[str, str]]) -> None:
+        """挂上进度框 在远端逐条执行命令"""
+        if not jobs or not self._ready():
+            return
+        dialog = QProgressDialog("准备中…", "取消", 0, len(jobs), self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        worker = FileCmdWorker(self._client, jobs, title, self)
+        dialog.canceled.connect(worker.stop)
+        worker.progress.connect(lambda done, total, name: self._update_progress(dialog, done, total, f"{title} {name}"))
+        worker.done.connect(lambda ok, message: self._finish_commands(dialog, worker, ok, message))
+        worker.finished.connect(worker.deleteLater)
+        self._cmd = worker
+        dialog.show()
+        worker.start()
+
+    def _finish_commands(self, dialog: QProgressDialog, worker: FileCmdWorker, ok: bool, message: str) -> None:
+        """命令收尾 关掉进度框 提示结果并重拉目录"""
+        dialog.close()
+        dialog.deleteLater()
+        if self._cmd is worker:
+            self._cmd = None
+        self._set_status(message)
+        if not ok:
+            QMessageBox.warning(self, "操作未全部成功", message)
+        self._reload()
 
     def _download(self, entries: list[RemoteEntry]) -> None:
         """选保存目录后把远端条目下载过去"""
@@ -788,12 +1008,13 @@ class BrowserPage(QWidget):
         self._run_transfer(UploadWorker(self._client, paths, self.remote_dir, self.server.os_type, self), "上传")
 
     def _ready(self) -> bool:
-        """传输前的连接与互斥检查"""
+        """改动远端前的连接与互斥检查"""
         if self._client is None:
             QMessageBox.warning(self, "未连接", "当前没有可用的服务器连接")
             return False
-        if self._transfer is not None and self._transfer.isRunning():
-            QMessageBox.information(self, "任务进行中", "请等当前传输结束或先取消")
+        busy = [worker for worker in (self._transfer, self._cmd) if worker is not None and worker.isRunning()]
+        if busy:
+            QMessageBox.information(self, "任务进行中", "请等当前任务结束或先取消")
             return False
         return True
 

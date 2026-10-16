@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import posixpath
+import re
 import stat
 import time
 from collections.abc import Callable
@@ -25,6 +26,9 @@ TEXT_LINE_LIMIT = 5000
 
 # 单文件传输进度回调 参数为 文件名 已传字节 总字节
 ProgressHook = Callable[[str, int, int], None]
+
+# Windows 的 SFTP 路径形如 /C:/Users/yf 要还原成盘符写法才好交给 cmd
+WINDOWS_DRIVE = re.compile(r"^/[A-Za-z]:")
 
 
 @dataclass(slots=True)
@@ -229,6 +233,56 @@ def upload_entry(
     if on_file:
         on_file(local, target)
     return 1
+
+
+def exists(sftp: paramiko.SFTPClient, path: str) -> bool:
+    """远端路径是否存在"""
+    try:
+        sftp.stat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def native_path(path: str, os_type: str) -> str:
+    """把 SFTP 路径换成远端系统认得的写法"""
+    if os_type != "windows":
+        return path
+    trimmed = path[1:] if WINDOWS_DRIVE.match(path) else path
+    return trimmed.replace("/", "\\")
+
+
+def quote(path: str, os_type: str) -> str:
+    """按远端 shell 的规则加引号 防止空格等字符把路径拆开"""
+    if os_type == "windows":
+        return f'"{path}"'
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def remove_command(path: str, is_dir: bool, os_type: str) -> str:
+    """删除远端文件或目录的命令 目标本来就不存在时同样按成功处理"""
+    target = quote(native_path(path, os_type), os_type)
+    if os_type == "windows":
+        # rmdir 找不到目录会返回非零 先探一次存在性
+        return f"if exist {target} rmdir /S /Q {target}" if is_dir else f"if exist {target} del /F /Q {target}"
+    return f"rm -rf -- {target}"
+
+
+def paste_command(src: str, is_dir: bool, dst: str, os_type: str, cut: bool) -> str:
+    """把远端条目复制或移动到完整目标路径 同名目标先删掉实现覆盖"""
+    source = quote(native_path(src, os_type), os_type)
+    target = quote(native_path(dst, os_type), os_type)
+    if os_type == "windows":
+        # 目标可能是文件也可能是目录 两种删法都试一遍
+        clear = f"(rd /S /Q {target} 2>nul || del /F /Q {target} 2>nul) & "
+        if cut:
+            return f"{clear}move /Y {source} {target}"
+        if is_dir:
+            # robocopy 退出码小于 8 都算成功 重新给出干净的退出码
+            return f"{clear}robocopy {source} {target} /E /IS /IT /NFL /NDL /NJH /NJS /NP & if errorlevel 8 (exit 1) else (exit 0)"
+        return f"{clear}copy /Y {source} {target}"
+    clear = f"rm -rf -- {target} && "
+    return f"{clear}{'mv' if cut else 'cp -a'} -- {source} {target}"
 
 
 def mark_executable(sftp: paramiko.SFTPClient, path: str) -> None:
