@@ -5,6 +5,7 @@ from __future__ import annotations
 import posixpath
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import paramiko
@@ -371,8 +372,11 @@ class TextWorker(QThread):
 class TransferWorker(QThread):
     """上传与下载的公共骨架 负责跨文件累加进度与中断"""
 
-    progress = Signal(int, int, str)
+    progress = Signal(int, int, str, str)
     done = Signal(bool, str)
+
+    # 速度采样窗口 单位秒
+    SPEED_WINDOW = 2.0
 
     def __init__(self, client: paramiko.SSHClient, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -382,6 +386,7 @@ class TransferWorker(QThread):
         self._total = 0
         self._current = ""
         self._last = 0
+        self._samples: deque[tuple[float, int]] = deque()
         self._failures: list[str] = []
 
     def stop(self) -> None:
@@ -399,7 +404,19 @@ class TransferWorker(QThread):
             self._last = 0
         self._transferred += done - self._last
         self._last = done
-        self.progress.emit(self._transferred, self._total, name)
+        self.progress.emit(self._transferred, self._total, name, self._speed_text())
+
+    def _speed_text(self) -> str:
+        """记录一次采样并给出最近窗口的平均速率 样本不足时返回空串"""
+        now = time.monotonic()
+        self._samples.append((now, self._transferred))
+        while len(self._samples) > 1 and now - self._samples[0][0] > self.SPEED_WINDOW:
+            self._samples.popleft()
+        if len(self._samples) < 2:
+            return ""
+        (start_time, start_bytes), (end_time, end_bytes) = self._samples[0], self._samples[-1]
+        span = end_time - start_time
+        return f"{format_size((end_bytes - start_bytes) / span)}/s" if span > 0 else ""
 
     def summary(self, text: str) -> str:
         """在结果描述后面附加失败清单"""
@@ -457,7 +474,7 @@ class DownloadWorker(TransferWorker):
     def run(self) -> None:
         """先统计总字节再逐个下载"""
         try:
-            self.progress.emit(0, 0, "正在统计…")
+            self.progress.emit(0, 0, "正在统计…", "")
             with self.client.open_sftp() as sftp:
                 self._total = sum(self._measure(sftp, entry) for entry in self.entries)
                 for entry in self.entries:
@@ -475,7 +492,7 @@ class DownloadWorker(TransferWorker):
 
     def _fetch(self, sftp: paramiko.SFTPClient, entry: RemoteEntry) -> None:
         """下载单个条目 单项失败不影响其余"""
-        self.progress.emit(self._transferred, self._total, entry.name)
+        self.progress.emit(self._transferred, self._total, entry.name, "")
         local = self.target / entry.name
         try:
             if entry.is_dir:
@@ -498,7 +515,7 @@ class UploadWorker(TransferWorker):
     def run(self) -> None:
         """先统计本地总字节再逐个上传"""
         try:
-            self.progress.emit(0, 0, "正在统计…")
+            self.progress.emit(0, 0, "正在统计…", "")
             self._total = sum(self._measure(path) for path in self.locals)
             uploaded = 0
             with self.client.open_sftp() as sftp:
@@ -1040,7 +1057,7 @@ class BrowserPage(QWidget):
         dialog.setAutoReset(False)
         dialog.setMinimumDuration(0)
         dialog.canceled.connect(worker.stop)
-        worker.progress.connect(lambda done, total, name: self._update_progress(dialog, done, total, f"{title} {name}"))
+        worker.progress.connect(lambda done, total, name, speed: self._update_progress(dialog, done, total, f"{title} {name} {speed}".rstrip()))
         worker.done.connect(lambda ok, message: self._finish_transfer(dialog, worker, ok, message))
         worker.finished.connect(worker.deleteLater)
         self._transfer = worker

@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 import ssh
+from browser_page import format_size
 from card_view import ROLE_EXTRA, ROLE_ICON, ROLE_KEY, ROLE_SUBTITLE, ROLE_TITLE, make_card_view
 from store import Project, Server, Store
 
@@ -52,7 +54,12 @@ class DeployWorker(QThread):
     """后台线程完成连接 上传 执行命令 日志通过信号回主线程"""
 
     log = Signal(str)
+    stage = Signal(str)
     done = Signal(bool, str)
+
+    # 状态行刷新间隔与速度采样窗口 单位秒
+    REFRESH_INTERVAL = 0.2
+    SPEED_WINDOW = 2.0
 
     def __init__(self, project: Project, server: Server, execute: bool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -61,6 +68,15 @@ class DeployWorker(QThread):
         self.execute = execute
         self._stop = threading.Event()
         self._client: paramiko.SSHClient | None = None
+        self._files = 0
+        self._total_bytes = 0
+        self._sent = 0
+        self._finished = 0
+        self._current = ""
+        self._current_sent = 0
+        self._current_start = 0.0
+        self._samples: deque[tuple[float, int]] = deque()
+        self._last_refresh = 0.0
 
     def stop(self) -> None:
         """请求中断 直接关闭连接让上传与读取立即抛错退出"""
@@ -76,13 +92,10 @@ class DeployWorker(QThread):
             sftp = self._client.open_sftp()
             self._note(f"已连接 {self.server.username}@{self.server.address}")
             remote = ssh.expand_path(sftp, self.project.remote_path)
-            count = ssh.upload_tree(
-                sftp,
-                Path(self.project.local_path),
-                remote,
-                self.server.os_type,
-                lambda path, target: self.log.emit(f"↑ {path.name} → {target}\n"),
-            )
+            local = Path(self.project.local_path)
+            self.stage.emit(f"正在统计本地文件 {local}")
+            self._measure(local)
+            count = ssh.upload_tree(sftp, local, remote, self.server.os_type, self._on_file, self._on_bytes)
             sftp.close()
             self._note(f"上传完成 共 {count} 个文件 目标目录 {remote}")
             if self._stop.is_set():
@@ -112,6 +125,51 @@ class DeployWorker(QThread):
             self.done.emit(False, "任务已停止")
             return
         self.done.emit(code == 0, f"命令结束 退出码 {code} 耗时 {time.monotonic() - start:.1f}s")
+
+    def _measure(self, root: Path) -> None:
+        """按上传的遍历规则统计本地文件数与总字节 供总进度显示"""
+        for entry in root.iterdir():
+            if entry.is_dir():
+                self._measure(entry)
+            elif entry.is_file():
+                self._files += 1
+                self._total_bytes += entry.stat().st_size
+
+    def _on_bytes(self, name: str, done: int, total: int) -> None:
+        """累加传输进度并节流刷新状态行"""
+        if name != self._current:
+            self._current = name
+            self._current_sent = 0
+            self._current_start = time.monotonic()
+        self._sent += done - self._current_sent
+        self._current_sent = done
+        now = time.monotonic()
+        self._samples.append((now, self._sent))
+        while len(self._samples) > 1 and now - self._samples[0][0] > self.SPEED_WINDOW:
+            self._samples.popleft()
+        if now - self._last_refresh < self.REFRESH_INTERVAL and done < total:
+            return
+        self._last_refresh = now
+        overall = f"{self._finished}/{self._files} 文件 {format_size(self._sent)}/{format_size(self._total_bytes)}"
+        self.stage.emit(f"↑ {name} {format_size(done)}/{format_size(total)} {self._speed_text()} ｜ 总 {overall}")
+
+    def _speed_text(self) -> str:
+        """最近采样窗口内的平均速率 样本不足时按零处理"""
+        if len(self._samples) < 2:
+            return "0 B/s"
+        (start_time, start_bytes), (end_time, end_bytes) = self._samples[0], self._samples[-1]
+        span = end_time - start_time
+        return f"{format_size((end_bytes - start_bytes) / span)}/s" if span > 0 else "0 B/s"
+
+    def _on_file(self, path: Path, target: str) -> None:
+        """单个文件传完 定格状态行并附上大小 耗时与平均速度"""
+        self._finished += 1
+        elapsed = time.monotonic() - self._current_start if self._current == path.name else 0.0
+        self._current = ""
+        size = path.stat().st_size
+        detail = f"{format_size(size)} {elapsed:.1f}s {format_size(size / elapsed)}/s" if elapsed > 0 else format_size(size)
+        self.stage.emit(f"↑ {path.name} → {target} {detail}")
+        self.stage.emit("")
 
     def _note(self, text: str) -> None:
         """输出一条带时间戳的阶段日志"""
@@ -212,6 +270,7 @@ class ProjectPage(QWidget):
         super().__init__(parent)
         self.store = store
         self.worker: DeployWorker | None = None
+        self._stage_open = False
 
         hint = QLabel("右键空白处新建项目；右键某个项目可上传并执行或仅上传")
         hint.setStyleSheet("color:#6b7280;padding:8px 12px;")
@@ -376,6 +435,7 @@ class ProjectPage(QWidget):
         self._append(f"\n{'=' * 56}\n{project.name} → {server.name}｜{'上传并执行' if execute else '仅上传'}\n")
         worker = DeployWorker(project, server, execute, self)
         worker.log.connect(self._append)
+        worker.stage.connect(self._stage)
         worker.done.connect(self._on_done)
         worker.finished.connect(worker.deleteLater)
         self.worker = worker
@@ -397,5 +457,27 @@ class ProjectPage(QWidget):
 
     def _append(self, text: str) -> None:
         """追加日志并滚到底部 不自动补换行以还原命令的原始输出"""
+        self._end_stage()
         self.log_view.moveCursor(QTextCursor.MoveOperation.End)
         self.log_view.insertPlainText(text)
+
+    def _stage(self, text: str) -> None:
+        """原地刷新末尾的状态行 空文本表示该行已结束"""
+        if not text:
+            self._end_stage()
+            return
+        block = self.log_view.document().lastBlock()
+        cursor = QTextCursor(block)
+        cursor.setPosition(block.position())
+        cursor.setPosition(block.position() + len(block.text()), QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(text)
+        self._stage_open = True
+        self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _end_stage(self) -> None:
+        """给未结束的状态行补上换行 让后续日志另起一行"""
+        if not self._stage_open:
+            return
+        self._stage_open = False
+        self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_view.insertPlainText("\n")
