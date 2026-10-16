@@ -169,16 +169,27 @@ class FileView(QListWidget):
     files_dropped = Signal(list)
 
     def dragEnterEvent(self, event) -> None:
-        """只接受来自资源管理器的本地文件"""
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        """拖入时接受 不接受的话连拖拽光标都不会出现"""
+        self._accept_local(event)
+
+    def dragMoveEvent(self, event) -> None:
+        """拖动过程要持续接受 默认实现会把落在空处的拖放判成放不了"""
+        self._accept_local(event)
 
     def dropEvent(self, event) -> None:
         """把拖入的本地路径交给页面处理"""
-        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
-        if paths:
-            self.files_dropped.emit(paths)
-            event.acceptProposedAction()
+        if self._accept_local(event):
+            self.files_dropped.emit([Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()])
+
+    def _accept_local(self, event) -> bool:
+        """只认资源管理器的本地路径 接受时一律按复制处理"""
+        urls = event.mimeData().urls()
+        if not any(url.isLocalFile() for url in urls):
+            event.ignore()
+            return False
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        return True
 
 
 class TextViewDialog(QDialog):
