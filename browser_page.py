@@ -575,6 +575,8 @@ class BrowserPage(QWidget):
         self.view.files_dropped.connect(self._start_upload)
         self.view.setDragDropMode(QListWidget.DragDropMode.DropOnly)
         self.view.setDefaultDropAction(Qt.DropAction.CopyAction)
+        # 拖放事件先投给视口 视口不接受的话资源管理器拖入会被直接丢掉
+        self.view.viewport().setAcceptDrops(True)
 
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(10, 8, 10, 4)
