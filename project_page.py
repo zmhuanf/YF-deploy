@@ -284,6 +284,7 @@ class ProjectPage(QWidget):
             menu.addAction("仅上传").setData("upload")
             menu.addSeparator()
             menu.addAction("编辑").setData("edit")
+            menu.addAction("复制为新项目").setData("duplicate")
             menu.addAction("删除").setData("delete")
         menu.addSeparator()
         menu.addAction("清空日志").setData("clear")
@@ -300,6 +301,8 @@ class ProjectPage(QWidget):
                 self._deploy(project, execute=False)
             case "edit":
                 self._edit(project)
+            case "duplicate":
+                self._duplicate(project)
             case "delete":
                 self._delete(project)
             case "clear":
@@ -325,6 +328,13 @@ class ProjectPage(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.store.upsert_project(dialog.result_project())
+        self.refresh()
+
+    def _duplicate(self, project: Project) -> None:
+        """克隆一份配置相同的新项目 id 置空由 Project 自动生成 名称加副本便于区分"""
+        clone = replace(project, id="")
+        clone.name = f"{project.name} 副本"
+        self.store.upsert_project(clone)
         self.refresh()
 
     def _edit_current(self) -> None:
