@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -12,6 +13,12 @@ DATA_DIR = Path(__file__).resolve().parent / ".data"
 
 # 数据目录可用环境变量改写 测试时指向临时目录 避免动到真实配置
 DATA_DIR_ENV = "YF_DEPLOY_DATA_DIR"
+
+# 全局 pi 启动指令模板的出厂值 用户可在右键菜单里改写
+DEFAULT_PI_TEMPLATE = "npm run start -- --ssh {username}@{host}:{port} --pass {password}"
+
+# 模板里支持替换的占位符
+PI_PLACEHOLDERS = ("name", "username", "host", "port", "password")
 
 
 @dataclass(slots=True)
@@ -38,13 +45,6 @@ class Server:
         return f"ssh -p {self.port} {self.username}@{self.host}"
 
     @property
-    def pi_command(self) -> str:
-        """交给 pi 启动的指令 未配置密码时返回空串"""
-        if not self.password:
-            return ""
-        return f"npm run start -- --ssh {self.username}@{self.host}:{self.port} --pass {self.password}"
-
-    @property
     def address(self) -> str:
         """地址与端口的展示形式"""
         return f"{self.host}:{self.port}"
@@ -66,6 +66,32 @@ class Project:
             self.id = uuid.uuid4().hex[:12]
 
 
+def render_pi_command(template: str, server: Server) -> str:
+    """把服务器信息套进模板 认不出的占位符原样保留"""
+    values = {
+        "name": server.name,
+        "username": server.username,
+        "host": server.host,
+        "port": str(server.port),
+        "password": server.password,
+    }
+    return re.sub(r"\{(\w+)\}", lambda match: values.get(match.group(1), match.group(0)), template)
+
+
+def _valid_template(raw) -> str:
+    """设置文件里读到的模板不可用时回落到出厂值"""
+    return raw.strip() if isinstance(raw, str) and raw.strip() else DEFAULT_PI_TEMPLATE
+
+
+def _load_settings(path: Path) -> dict:
+    """读取设置文件 文件缺失或损坏时按空处理"""
+    try:
+        raw = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def _load(path: Path, cls: type) -> list:
     """读取 JSON 列表 忽略数据类里已不存在的字段；文件损坏时按空处理"""
     if not path.exists():
@@ -84,15 +110,17 @@ def _dump(path: Path, items: list) -> None:
 
 
 class Store:
-    """servers.json 与 projects.json 的读写入口"""
+    """servers.json projects.json settings.json 的读写入口"""
 
     def __init__(self, data_dir: Path | None = None) -> None:
         root = Path(data_dir or os.environ.get(DATA_DIR_ENV) or DATA_DIR)
         root.mkdir(parents=True, exist_ok=True)
         self.servers_file = root / "servers.json"
         self.projects_file = root / "projects.json"
+        self.settings_file = root / "settings.json"
         self.servers: list[Server] = _load(self.servers_file, Server)
         self.projects: list[Project] = _load(self.projects_file, Project)
+        self.pi_template: str = _valid_template(_load_settings(self.settings_file).get("pi_template"))
 
     def server(self, server_id: str) -> Server | None:
         """按 id 取服务器 不存在返回 None"""
@@ -101,6 +129,15 @@ class Store:
     def project(self, project_id: str) -> Project | None:
         """按 id 取项目 不存在返回 None"""
         return next((item for item in self.projects if item.id == project_id), None)
+
+    def pi_command(self, server: Server) -> str:
+        """按全局模板生成这台服务器的 pi 启动指令"""
+        return render_pi_command(self.pi_template, server)
+
+    def save_pi_template(self, template: str) -> None:
+        """保存全局模板并落盘 空模板回落到出厂值"""
+        self.pi_template = template.strip() or DEFAULT_PI_TEMPLATE
+        self.settings_file.write_text(json.dumps({"pi_template": self.pi_template}, ensure_ascii=False, indent=2), "utf-8")
 
     def upsert_server(self, server: Server) -> None:
         """按 id 覆盖保存服务器 不存在的则追加"""

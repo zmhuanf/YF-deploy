@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from card_view import ROLE_BADGE, ROLE_ICON, ROLE_KEY, ROLE_SUBTITLE, ROLE_TITLE, make_card_view
-from store import Server, Store
+from store import DEFAULT_PI_TEMPLATE, PI_PLACEHOLDERS, Server, Store, render_pi_command
 
 OS_LABELS = {"linux": "Linux", "windows": "Windows"}
 
@@ -142,6 +143,62 @@ class ServerDialog(QDialog):
         return holder
 
 
+class PiTemplateDialog(QDialog):
+    """编辑全局 pi 启动指令模板 并按当前服务器实时预览效果"""
+
+    def __init__(self, store: Store, server: Server, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("编辑 pi 启动指令")
+        self.setMinimumWidth(560)
+        self._server = server
+
+        self.template_edit = QPlainTextEdit(store.pi_template)
+        self.template_edit.setFixedHeight(84)
+        hint = QLabel("可用占位符：" + "　".join(f"{{{key}}}" for key in PI_PLACEHOLDERS))
+        hint.setStyleSheet("color:#6b7280;")
+        hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.preview.setStyleSheet(
+            "background:#f6f7f9;color:#1f2328;border:1px solid #dcdfe6;border-radius:4px;padding:8px;"
+            'font-family:Consolas,"Courier New",monospace;'
+        )
+
+        reset = QPushButton("恢复默认")
+        reset.clicked.connect(lambda: self.template_edit.setPlainText(DEFAULT_PI_TEMPLATE))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        footer = QHBoxLayout()
+        footer.addWidget(reset)
+        footer.addStretch(1)
+        footer.addWidget(buttons)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("模板（全局，所有服务器共用）"))
+        layout.addWidget(self.template_edit)
+        layout.addWidget(hint)
+        layout.addSpacing(8)
+        layout.addWidget(QLabel(f"预览（以「{server.name}」为例）"))
+        layout.addWidget(self.preview)
+        layout.addLayout(footer)
+
+        self.template_edit.textChanged.connect(self._refresh_preview)
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        """模板改动后立即重算预览"""
+        command = render_pi_command(self.template_edit.toPlainText(), self._server)
+        self.preview.setText(command or "（模板为空，保存后按默认值处理）")
+
+    def template(self) -> str:
+        """去掉首尾空白的模板文本"""
+        return self.template_edit.toPlainText().strip()
+
+
 class ServerPage(QWidget):
     """服务器列表页 右键新建 复制连接指令 编辑 删除"""
 
@@ -152,7 +209,7 @@ class ServerPage(QWidget):
         super().__init__(parent)
         self.store = store
 
-        hint = QLabel("双击服务器进入文件管理；右键可新建、复制连接指令、编辑、删除")
+        hint = QLabel("双击服务器进入文件管理；右键可新建、复制连接指令、编辑 pi 模板、删除")
         hint.setStyleSheet("color:#6b7280;padding:8px 12px;")
 
         self.view = make_card_view()
@@ -191,11 +248,8 @@ class ServerPage(QWidget):
         else:
             self.view.setCurrentIndex(index)
             menu.addAction("复制 SSH 连接指令").setData("ssh")
-            pi_action = menu.addAction("复制 pi 启动指令")
-            pi_action.setData("pi")
-            pi_action.setEnabled(bool(server.password))
-            if not server.password:
-                pi_action.setToolTip("该服务器未配置密码，无法生成 pi 启动指令")
+            menu.addAction("复制 pi 启动指令").setData("pi")
+            menu.addAction("编辑 pi 启动指令").setData("pi_edit")
             menu.addSeparator()
             menu.addAction("编辑").setData("edit")
             menu.addAction("删除").setData("delete")
@@ -209,7 +263,9 @@ class ServerPage(QWidget):
             case "ssh":
                 self._copy(server.ssh_command, "SSH 连接指令已复制到剪贴板")
             case "pi":
-                self._copy(server.pi_command, "pi 启动指令已复制到剪贴板")
+                self._copy(self.store.pi_command(server), "pi 启动指令已复制到剪贴板")
+            case "pi_edit":
+                self._edit_pi_template(server)
             case "edit":
                 self._edit(server)
             case "delete":
@@ -230,6 +286,14 @@ class ServerPage(QWidget):
             return
         self.store.upsert_server(dialog.result_server())
         self._commit()
+
+    def _edit_pi_template(self, server: Server) -> None:
+        """编辑全局 pi 启动指令模板 拿当前服务器当预览样本"""
+        dialog = PiTemplateDialog(self.store, server, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.store.save_pi_template(dialog.template())
+        self.window().statusBar().showMessage("pi 启动指令模板已保存", 3000)
 
     def _open_current(self) -> None:
         """双击卡片进入远端文件管理器"""
