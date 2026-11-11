@@ -1,0 +1,6 @@
+- 数据目录 .data，环境变量 YF_DEPLOY_DATA_DIR 可改指向，测试时务必指向临时目录别动真实配置
+- 持久化一律走 store.Store，别在别处直接读写 .data 里的 json
+- 卡片列表统一用 card_view.make_card_view，展示字段靠 ROLE_* 角色传，不要改委托的布局
+- 证书解析在 certs.py，依赖 cryptography（paramiko 已自带，requirements 里已声明）
+- 证书归档件在 .data/certs，文件名由 store.add_certificate 生成，证书固定 .crt 私钥固定 .key
+- 网络与耗时操作放 QThread，结果用 Signal 回主线程，界面上不阻塞

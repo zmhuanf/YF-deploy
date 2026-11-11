@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from browser_page import BrowserPage
+from cert_page import CertPage
 from project_page import ProjectPage
 from server_page import ServerPage
 from store import Server, Store
@@ -52,7 +53,7 @@ QPlainTextEdit#log, QPlainTextEdit#viewer {
 }
 """
 
-NAV_ITEMS = ("服务器", "项目")
+NAV_ITEMS = ("服务器", "项目", "证书")
 
 
 class MainWindow(QMainWindow):
@@ -73,8 +74,9 @@ class MainWindow(QMainWindow):
 
         self.server_page = ServerPage(self.store)
         self.project_page = ProjectPage(self.store)
+        self.cert_page = CertPage(self.store)
         self.browser_page = BrowserPage()
-        for title, page in zip(NAV_ITEMS, (self.server_page, self.project_page)):
+        for title, page in zip(NAV_ITEMS, (self.server_page, self.project_page, self.cert_page)):
             self.nav.addItem(QListWidgetItem(title))
             self.pages.addWidget(page)
         self.pages.addWidget(self.browser_page)

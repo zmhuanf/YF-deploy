@@ -1,12 +1,13 @@
-"""服务器与项目的数据模型 以及 .data 目录下的 JSON 持久化"""
+"""服务器 项目 证书的数据模型 以及 .data 目录下的 JSON 持久化"""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import uuid
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / ".data"
@@ -19,6 +20,9 @@ DEFAULT_PI_TEMPLATE = "npm run start -- --ssh {username}@{host}:{port} --pass {p
 
 # 模板里支持替换的占位符
 PI_PLACEHOLDERS = ("name", "username", "host", "port", "password")
+
+# 证书归档文件名里不允许出现的字符
+ILLEGAL_FILE_CHARS = re.compile(r"[^A-Za-z0-9.-]")
 
 
 @dataclass(slots=True)
@@ -59,6 +63,24 @@ class Project:
     local_path: str = ""
     remote_path: str = ""
     command: str = ""
+    id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = uuid.uuid4().hex[:12]
+
+
+@dataclass(slots=True)
+class Certificate:
+    """一对已归档的证书与私钥 cert_file key_file 只存文件名 实际位于 <data>/certs"""
+
+    name: str = ""
+    domains: list[str] = field(default_factory=list)
+    not_before: str = ""
+    not_after: str = ""
+    key_type: str = ""
+    cert_file: str = ""
+    key_file: str = ""
     id: str = ""
 
     def __post_init__(self) -> None:
@@ -110,16 +132,20 @@ def _dump(path: Path, items: list) -> None:
 
 
 class Store:
-    """servers.json projects.json settings.json 的读写入口"""
+    """服务器 项目 证书与设置文件的读写入口"""
 
     def __init__(self, data_dir: Path | None = None) -> None:
         root = Path(data_dir or os.environ.get(DATA_DIR_ENV) or DATA_DIR)
-        root.mkdir(parents=True, exist_ok=True)
+        certs_dir = root / "certs"
+        certs_dir.mkdir(parents=True, exist_ok=True)
         self.servers_file = root / "servers.json"
         self.projects_file = root / "projects.json"
+        self.certs_file = root / "certs.json"
         self.settings_file = root / "settings.json"
+        self.certs_dir = certs_dir
         self.servers: list[Server] = _load(self.servers_file, Server)
         self.projects: list[Project] = _load(self.projects_file, Project)
+        self.certificates: list[Certificate] = _load(self.certs_file, Certificate)
         self.pi_template: str = _valid_template(_load_settings(self.settings_file).get("pi_template"))
 
     def server(self, server_id: str) -> Server | None:
@@ -129,6 +155,10 @@ class Store:
     def project(self, project_id: str) -> Project | None:
         """按 id 取项目 不存在返回 None"""
         return next((item for item in self.projects if item.id == project_id), None)
+
+    def certificate(self, cert_id: str) -> Certificate | None:
+        """按 id 取证书 不存在返回 None"""
+        return next((item for item in self.certificates if item.id == cert_id), None)
 
     def pi_command(self, server: Server) -> str:
         """按全局模板生成这台服务器的 pi 启动指令"""
@@ -158,6 +188,35 @@ class Store:
         """删除项目并落盘"""
         self.projects = [item for item in self.projects if item.id != project_id]
         _dump(self.projects_file, self.projects)
+
+    def add_certificate(self, cert: Certificate, cert_source: Path, key_source: Path) -> None:
+        """复制证书与私钥进 certs 目录 文件名按主域名与 id 生成 后缀固定 crt 与 key"""
+        while True:
+            stem = f"{ILLEGAL_FILE_CHARS.sub('_', cert.name.removeprefix('*.') or 'cert')}-{cert.id}"
+            cert_path, key_path = self.certs_dir / f"{stem}.crt", self.certs_dir / f"{stem}.key"
+            if not cert_path.exists() and not key_path.exists():
+                break
+            # 同名文件已存在就不覆盖 换个 id 重来
+            cert.id = uuid.uuid4().hex[:12]
+        shutil.copyfile(cert_source, cert_path)
+        try:
+            shutil.copyfile(key_source, key_path)
+        except OSError:
+            cert_path.unlink(missing_ok=True)
+            raise
+        cert.cert_file, cert.key_file = cert_path.name, key_path.name
+        self.certificates.append(cert)
+        _dump(self.certs_file, self.certificates)
+
+    def remove_certificate(self, cert_id: str) -> None:
+        """删除证书记录并清掉它归档的两份文件"""
+        removed = [item for item in self.certificates if item.id == cert_id]
+        self.certificates = [item for item in self.certificates if item.id != cert_id]
+        _dump(self.certs_file, self.certificates)
+        for item in removed:
+            for name in (item.cert_file, item.key_file):
+                if name:
+                    (self.certs_dir / name).unlink(missing_ok=True)
 
     @staticmethod
     def _upsert(items: list, item) -> None:

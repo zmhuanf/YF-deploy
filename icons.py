@@ -23,6 +23,7 @@ ICONS = {
     "archive": _HEAD + '<rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9"/><path d="M10 13h4"/></svg>',
     "image": _HEAD + '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.4"/><path d="M21 15.5l-5-5-6.5 6.5-2.5-2.5-4 4"/></svg>',
     "text": _HEAD + '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>',
+    "cert": _HEAD + '<rect x="3" y="3" width="14" height="13" rx="2"/><path d="M7 7h6M7 10.5h4"/><circle cx="16.5" cy="15.5" r="2.6"/><path d="M15 17.6l-.8 3.1 2.3-1.1 2.3 1.1-.8-3.1"/></svg>',
 }
 
 # 后缀到图标名的映射 未命中的一律用通用文件图标
@@ -38,6 +39,7 @@ SUFFIX_ICONS = {
     ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image", ".bmp": "image",
     ".svg": "image", ".webp": "image", ".ico": "image", ".tiff": "image",
     ".txt": "text", ".md": "text", ".log": "text", ".csv": "text", ".conf": "text", ".cfg": "text",
+    ".crt": "cert", ".cer": "cert", ".pem": "cert", ".key": "cert", ".pfx": "cert", ".p12": "cert",
 }
 
 

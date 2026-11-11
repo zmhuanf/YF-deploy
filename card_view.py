@@ -14,6 +14,7 @@ ROLE_SUBTITLE = Qt.ItemDataRole.UserRole + 3
 ROLE_EXTRA = Qt.ItemDataRole.UserRole + 4
 ROLE_BADGE = Qt.ItemDataRole.UserRole + 5
 ROLE_KEY = Qt.ItemDataRole.UserRole + 6
+ROLE_BADGE_COLOR = Qt.ItemDataRole.UserRole + 7
 
 GRID_SIZE = QSize(292, 104)
 PADDING = 6
@@ -99,7 +100,8 @@ class CardDelegate(QStyledItemDelegate):
         self._draw_title(painter, option.font, left, title_right, top, index.data(ROLE_TITLE) or "")
         self._draw_body(painter, option.font, left, right, top, lines)
         if badge_width:
-            self._draw_badge(painter, option.font, right, top, badge, badge_width)
+            color = index.data(ROLE_BADGE_COLOR) or COLOR_BADGE_TEXT
+            self._draw_badge(painter, option.font, right, top, badge, badge_width, color)
         painter.restore()
 
     def _draw_title(self, painter: QPainter, base: QFont, left: int, right: int, top: int, title: str) -> None:
@@ -124,8 +126,8 @@ class CardDelegate(QStyledItemDelegate):
             width = right - left
             painter.drawText(QRect(left, y, width, self.LINE_HEIGHT), self._align(), metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, width))
 
-    def _draw_badge(self, painter: QPainter, base: QFont, right: int, top: int, badge: str, badge_width: int) -> None:
-        """绘制标题行右侧的角标"""
+    def _draw_badge(self, painter: QPainter, base: QFont, right: int, top: int, badge: str, badge_width: int, color: str) -> None:
+        """绘制标题行右侧的角标 文字颜色由数据角色决定"""
         font = QFont(base)
         font.setPixelSize(10)
         painter.setFont(font)
@@ -133,7 +135,7 @@ class CardDelegate(QStyledItemDelegate):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(COLOR_BADGE_BG))
         painter.drawRoundedRect(rect, 6, 6)
-        painter.setPen(QColor(COLOR_BADGE_TEXT))
+        painter.setPen(QColor(color))
         painter.drawText(rect, self._align(), badge)
 
     def _icon(self, key: str, selected: bool, widget: QWidget | None) -> QPixmap:
