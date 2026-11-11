@@ -34,10 +34,10 @@ from PySide6.QtWidgets import (
 import ssh
 from browser_page import format_size
 from card_view import ROLE_EXTRA, ROLE_ICON, ROLE_KEY, ROLE_SUBTITLE, ROLE_TITLE, make_card_view
-from store import Project, Server, Store
+from store import Certificate, Project, Server, Store
 
 
-def project_tooltip(project: Project, server: Server | None) -> str:
+def project_tooltip(project: Project, server: Server | None, cert: Certificate | None) -> str:
     """悬停时补全卡片上放不下的信息"""
     rows = [
         project.name,
@@ -47,6 +47,10 @@ def project_tooltip(project: Project, server: Server | None) -> str:
     ]
     if project.command:
         rows.append(f"命令 {project.command}")
+    if project.cert_id:
+        rows.append(f"证书 {cert.name if cert else '已删除'}")
+        rows.append(f"证书路径 {project.cert_remote_path}")
+        rows.append(f"私钥路径 {project.key_remote_path}")
     return "\n".join(rows)
 
 
@@ -61,11 +65,20 @@ class DeployWorker(QThread):
     REFRESH_INTERVAL = 0.2
     SPEED_WINDOW = 2.0
 
-    def __init__(self, project: Project, server: Server, execute: bool, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        project: Project,
+        server: Server,
+        execute: bool,
+        parent: QWidget | None = None,
+        cert_files: list[tuple[Path, str]] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.project = project
         self.server = server
         self.execute = execute
+        # 传入证书文件时只传这几个文件 不上传本地目录
+        self.cert_files = cert_files
         self._stop = threading.Event()
         self._client: paramiko.SSHClient | None = None
         self._files = 0
@@ -92,17 +105,22 @@ class DeployWorker(QThread):
             sftp = self._client.open_sftp()
             self._note(f"已连接 {self.server.username}@{self.server.address}")
             remote = ssh.expand_path(sftp, self.project.remote_path)
-            local = Path(self.project.local_path)
-            self.stage.emit(f"正在统计本地文件 {local}")
-            self._measure(local)
-            count = ssh.upload_tree(sftp, local, remote, self.server.os_type, self._on_file, self._on_bytes)
+            if self.cert_files:
+                count = self._upload_certs(sftp)
+                self._note(f"证书上传完成 共 {count} 个文件")
+            else:
+                local = Path(self.project.local_path)
+                self.stage.emit(f"正在统计本地文件 {local}")
+                self._measure(local)
+                count = ssh.upload_tree(sftp, local, remote, self.server.os_type, self._on_file, self._on_bytes)
+                self._note(f"上传完成 共 {count} 个文件 目标目录 {remote}")
             sftp.close()
-            self._note(f"上传完成 共 {count} 个文件 目标目录 {remote}")
             if self._stop.is_set():
                 self.done.emit(False, "任务已停止")
                 return
             if not self.execute:
-                self.done.emit(True, f"仅上传完成 共 {count} 个文件 耗时 {time.monotonic() - start:.1f}s")
+                action = "仅更新证书" if self.cert_files else "仅上传"
+                self.done.emit(True, f"{action}完成 共 {count} 个文件 耗时 {time.monotonic() - start:.1f}s")
                 return
             self._run_remote(remote, count, start)
         except Exception as error:
@@ -111,6 +129,15 @@ class DeployWorker(QThread):
             if self._client:
                 self._client.close()
                 self._client = None
+
+    def _upload_certs(self, sftp: paramiko.SFTPClient) -> int:
+        """把证书与私钥传到各自配置的远程完整路径 同名覆盖"""
+        self._files = len(self.cert_files)
+        self._total_bytes = sum(local.stat().st_size for local, _ in self.cert_files)
+        for local, remote in self.cert_files:
+            target = ssh.upload_file(sftp, local, remote, self.server.os_type, self._on_bytes)
+            self._on_file(local, target)
+        return self._files
 
     def _run_remote(self, remote: str, count: int, start: float) -> None:
         """在远程目标目录下执行项目配置的命令"""
@@ -179,7 +206,13 @@ class DeployWorker(QThread):
 class ProjectDialog(QDialog):
     """新建/编辑项目的表单"""
 
-    def __init__(self, parent: QWidget | None = None, project: Project | None = None, servers: list[Server] | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        project: Project | None = None,
+        servers: list[Server] | None = None,
+        certificates: list[Certificate] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("编辑项目" if project else "新建项目")
         self.setMinimumWidth(620)
@@ -203,6 +236,21 @@ class ProjectDialog(QDialog):
         self.remote_edit.setPlaceholderText("远程目标目录 不存在会自动创建")
         self.command_edit = QLineEdit(project.command if project else "")
         self.command_edit.setPlaceholderText("在远程目录下执行的命令 例如 sh start.sh")
+        self.cert_combo = QComboBox()
+        self.cert_combo.addItem("不使用证书", "")
+        for cert in certificates or []:
+            self.cert_combo.addItem(f"{cert.name}　到期 {cert.not_after}", cert.id)
+        if project and project.cert_id:
+            index = self.cert_combo.findData(project.cert_id)
+            if index < 0:
+                # 原证书已被删除时插占位项 避免静默绑定到列表里的其它证书
+                self.cert_combo.insertItem(0, "（原证书已删除 请重新选择）", "")
+                index = 0
+            self.cert_combo.setCurrentIndex(index)
+        self.cert_path_edit = QLineEdit(project.cert_remote_path if project else "")
+        self.cert_path_edit.setPlaceholderText("证书文件的远程完整路径 例如 /etc/nginx/ssl/example.crt")
+        self.key_path_edit = QLineEdit(project.key_remote_path if project else "")
+        self.key_path_edit.setPlaceholderText("私钥文件的远程完整路径 例如 /etc/nginx/ssl/example.key")
 
         browse = QPushButton("浏览…")
         browse.clicked.connect(self._pick_folder)
@@ -219,6 +267,9 @@ class ProjectDialog(QDialog):
         form.addRow("本地路径 *", local_row)
         form.addRow("远程路径 *", self.remote_edit)
         form.addRow("执行命令", self.command_edit)
+        form.addRow("证书", self.cert_combo)
+        form.addRow("证书路径", self.cert_path_edit)
+        form.addRow("私钥路径", self.key_path_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
@@ -244,6 +295,9 @@ class ProjectDialog(QDialog):
         if not self.remote_edit.text().strip():
             QMessageBox.warning(self, "信息不完整", "请填写远程路径")
             return
+        if self.cert_combo.currentData() and not (self.cert_path_edit.text().strip() and self.key_path_edit.text().strip()):
+            QMessageBox.warning(self, "信息不完整", "选择证书后需填写证书与私钥的远程文件路径")
+            return
         super().accept()
 
     def result_project(self) -> Project:
@@ -254,6 +308,9 @@ class ProjectDialog(QDialog):
         project.local_path = self.local_edit.text().strip()
         project.remote_path = self.remote_edit.text().strip()
         project.command = self.command_edit.text().strip()
+        project.cert_id = self.cert_combo.currentData()
+        project.cert_remote_path = self.cert_path_edit.text().strip()
+        project.key_remote_path = self.key_path_edit.text().strip()
         return project
 
     def _pick_folder(self) -> None:
@@ -264,7 +321,7 @@ class ProjectDialog(QDialog):
 
 
 class ProjectPage(QWidget):
-    """项目列表页 右键上传并执行或仅上传 日志显示在下方"""
+    """项目列表页 右键上传执行或更新证书 日志显示在下方"""
 
     def __init__(self, store: Store, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -272,7 +329,7 @@ class ProjectPage(QWidget):
         self.worker: DeployWorker | None = None
         self._stage_open = False
 
-        hint = QLabel("右键空白处新建项目；右键某个项目可上传并执行或仅上传")
+        hint = QLabel("右键空白处新建项目；右键某个项目可上传执行或更新证书")
         hint.setStyleSheet("color:#6b7280;padding:8px 12px;")
 
         self.view = make_card_view()
@@ -320,13 +377,14 @@ class ProjectPage(QWidget):
         self.view.clear()
         for project in self.store.projects:
             server = self.store.server(project.server_id)
+            cert = self.store.certificate(project.cert_id) if project.cert_id else None
             item = QListWidgetItem()
             item.setData(ROLE_ICON, "project")
             item.setData(ROLE_TITLE, project.name)
             item.setData(ROLE_SUBTITLE, server.name if server else "（服务器已删除）")
             item.setData(ROLE_EXTRA, project.remote_path)
             item.setData(ROLE_KEY, project.id)
-            item.setToolTip(project_tooltip(project, server))
+            item.setToolTip(project_tooltip(project, server, cert))
             self.view.addItem(item)
 
     def _context_menu(self, pos) -> None:
@@ -341,6 +399,8 @@ class ProjectPage(QWidget):
             self.view.setCurrentIndex(index)
             menu.addAction("上传并执行").setData("deploy")
             menu.addAction("仅上传").setData("upload")
+            menu.addAction("更新证书并执行").setData("cert_deploy")
+            menu.addAction("仅更新证书").setData("cert_upload")
             menu.addSeparator()
             menu.addAction("编辑").setData("edit")
             menu.addAction("复制为新项目").setData("duplicate")
@@ -358,6 +418,10 @@ class ProjectPage(QWidget):
                 self._deploy(project, execute=True)
             case "upload":
                 self._deploy(project, execute=False)
+            case "cert_deploy":
+                self._update_cert(project, execute=True)
+            case "cert_upload":
+                self._update_cert(project, execute=False)
             case "edit":
                 self._edit(project)
             case "duplicate":
@@ -372,7 +436,7 @@ class ProjectPage(QWidget):
         if not self.store.servers:
             QMessageBox.warning(self, "缺少服务器", "请先在「服务器」页新建一台服务器")
             return
-        dialog = ProjectDialog(self, servers=self.store.servers)
+        dialog = ProjectDialog(self, servers=self.store.servers, certificates=self.store.certificates)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.store.upsert_project(dialog.result_project())
@@ -383,7 +447,7 @@ class ProjectPage(QWidget):
         if not self.store.servers:
             QMessageBox.warning(self, "缺少服务器", "请先在「服务器」页新建一台服务器")
             return
-        dialog = ProjectDialog(self, project, self.store.servers)
+        dialog = ProjectDialog(self, project, self.store.servers, self.store.certificates)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.store.upsert_project(dialog.result_project())
@@ -431,9 +495,39 @@ class ProjectPage(QWidget):
         if not project.remote_path.strip():
             QMessageBox.warning(self, "远程路径为空", "请先编辑项目填写远程目标目录")
             return
+        self._start(project, server, execute, "上传并执行" if execute else "仅上传")
 
-        self._append(f"\n{'=' * 56}\n{project.name} → {server.name}｜{'上传并执行' if execute else '仅上传'}\n")
-        worker = DeployWorker(project, server, execute, self)
+    def _update_cert(self, project: Project, execute: bool) -> None:
+        """上传项目绑定的证书与私钥到配置的远程路径 按需执行命令"""
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "任务进行中", "已有任务在运行，请等它结束或先点「停止」")
+            return
+        server = self.store.server(project.server_id)
+        if server is None:
+            QMessageBox.warning(self, "缺少服务器", "该项目关联的服务器已不存在，请编辑项目重新选择")
+            return
+        cert = self.store.certificate(project.cert_id) if project.cert_id else None
+        if cert is None:
+            reason = "绑定的证书已被删除，请编辑项目重新选择" if project.cert_id else "请先编辑项目选择证书"
+            QMessageBox.warning(self, "缺少证书", reason)
+            return
+        if not project.cert_remote_path.strip() or not project.key_remote_path.strip():
+            QMessageBox.warning(self, "远程路径为空", "请先编辑项目填写证书与私钥的远程文件路径")
+            return
+        cert_files = [
+            (self.store.certs_dir / cert.cert_file, project.cert_remote_path),
+            (self.store.certs_dir / cert.key_file, project.key_remote_path),
+        ]
+        for local, _ in cert_files:
+            if not local.is_file():
+                QMessageBox.warning(self, "证书文件缺失", f"证书库文件不存在：{local}")
+                return
+        self._start(project, server, execute, "更新证书并执行" if execute else "仅更新证书", cert_files)
+
+    def _start(self, project: Project, server: Server, execute: bool, label: str, cert_files: list[tuple[Path, str]] | None = None) -> None:
+        """挂好日志信号并启动后台任务"""
+        self._append(f"\n{'=' * 56}\n{project.name} → {server.name}｜{label}\n")
+        worker = DeployWorker(project, server, execute, self, cert_files=cert_files)
         worker.log.connect(self._append)
         worker.stage.connect(self._stage)
         worker.done.connect(self._on_done)

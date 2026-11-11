@@ -24,13 +24,13 @@ def cert_tooltip(cert: Certificate, days: int) -> str:
 
 
 class CertPage(QWidget):
-    """证书列表页 右键空白处添加证书 右键卡片可打开位置或删除"""
+    """证书列表页 右键空白处添加证书 右键卡片可编辑 打开位置或删除"""
 
     def __init__(self, store: Store, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.store = store
 
-        hint = QLabel("右键空白处添加证书；右键某张证书可打开所在文件夹或删除")
+        hint = QLabel("右键空白处添加证书；右键某张证书可编辑、打开所在文件夹或删除")
         hint.setStyleSheet("color:#6b7280;padding:8px 12px;")
 
         self.view = make_card_view()
@@ -76,6 +76,7 @@ class CertPage(QWidget):
             menu.addAction("刷新").setData("refresh")
         else:
             self.view.setCurrentIndex(index)
+            menu.addAction("编辑").setData("edit")
             menu.addAction("打开所在文件夹").setData("open")
             menu.addSeparator()
             menu.addAction("删除").setData("delete")
@@ -88,6 +89,8 @@ class CertPage(QWidget):
                 self._create()
             case "refresh":
                 self.refresh()
+            case "edit":
+                self._edit(cert)
             case "open":
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.certs_dir)))
             case "delete":
@@ -100,6 +103,12 @@ class CertPage(QWidget):
     def _create(self) -> None:
         """添加证书 弹框内已完成解析与归档"""
         dialog = CertDialog(self.store, self)
+        if dialog.exec() == CertDialog.DialogCode.Accepted:
+            self.refresh()
+
+    def _edit(self, cert: Certificate) -> None:
+        """替换证书 复用新增弹框 域名须与原证书一致"""
+        dialog = CertDialog(self.store, self, target=cert)
         if dialog.exec() == CertDialog.DialogCode.Accepted:
             self.refresh()
 

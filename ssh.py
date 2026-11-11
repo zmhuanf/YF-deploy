@@ -219,6 +219,20 @@ def upload_tree(
     return count
 
 
+def upload_file(
+    sftp: paramiko.SFTPClient,
+    local: Path,
+    remote: str,
+    os_type: str = "linux",
+    on_bytes: ProgressHook | None = None,
+) -> str:
+    """上传单个文件到指定远程完整路径 可改名 父目录自动创建 返回展开后的目标路径"""
+    target = expand_path(sftp, remote)
+    _make_dirs(sftp, posixpath.dirname(target))
+    _put_file(sftp, local, target, os_type, on_bytes)
+    return target
+
+
 def upload_entry(
     sftp: paramiko.SFTPClient,
     local: Path,
@@ -230,10 +244,7 @@ def upload_entry(
     """把本地文件或文件夹放进远程目录 文件夹保留自身的名字层级 返回上传的文件数"""
     if local.is_dir():
         return upload_tree(sftp, local, posixpath.join(expand_path(sftp, remote_dir), local.name), os_type, on_file, on_bytes)
-    target_dir = expand_path(sftp, remote_dir)
-    _make_dirs(sftp, target_dir)
-    target = posixpath.join(target_dir, local.name)
-    _put_file(sftp, local, target, os_type, on_bytes)
+    target = upload_file(sftp, local, posixpath.join(expand_path(sftp, remote_dir), local.name), os_type, on_bytes)
     if on_file:
         on_file(local, target)
     return 1

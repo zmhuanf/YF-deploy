@@ -3,4 +3,7 @@
 - 卡片列表统一用 card_view.make_card_view，展示字段靠 ROLE_* 角色传，不要改委托的布局
 - 证书解析在 certs.py，依赖 cryptography（paramiko 已自带，requirements 里已声明）
 - 证书归档件在 .data/certs，文件名由 store.add_certificate 生成，证书固定 .crt 私钥固定 .key
+- 证书新增/替换共用 CertDialog（target 参数区分），替换走 store.replace_certificate，id 与归档文件名不变，域名按集合一致校验
+- 项目的「更新证书」只传证书与私钥两个文件不传本地目录，命令仍在项目 remote_path 下执行；单文件改名上传用 ssh.upload_file
 - 网络与耗时操作放 QThread，结果用 Signal 回主线程，界面上不阻塞
+- 启动.bat 用 pythonw 静默启动无控制台，排错要手动 python app.py 才有报错输出

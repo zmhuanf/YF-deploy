@@ -1,4 +1,4 @@
-"""添加证书的弹框 拖入一对证书与私钥后解析展示"""
+"""添加或替换证书的弹框 拖入一对证书与私钥后解析展示"""
 
 from __future__ import annotations
 
@@ -56,21 +56,27 @@ class CertDropArea(QLabel):
 
 
 class CertDialog(QDialog):
-    """添加证书 拖入或选取文件后自动识别域名与到期时间"""
+    """添加或替换证书 拖入或选取文件后自动识别 替换时校验域名与原证书一致"""
 
-    def __init__(self, store: Store, parent: QWidget | None = None) -> None:
+    def __init__(self, store: Store, parent: QWidget | None = None, target: Certificate | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("添加证书")
+        self.setWindowTitle("替换证书" if target else "添加证书")
         self.setMinimumWidth(560)
         self.setAcceptDrops(True)
         self._store = store
+        self._target = target
         self._cert_path: Path | None = None
         self._key_path: Path | None = None
         self._cert: certs.CertInfo | None = None
         self._key: certs.KeyInfo | None = None
 
+        self._drop_hint = (
+            f"拖入新的证书和私钥替换「{target.name}」\n域名必须与原证书相同"
+            if target
+            else DROP_HINT
+        )
         self.drop_area = CertDropArea(self._accept_files)
-        self.drop_area.setText(DROP_HINT)
+        self.drop_area.setText(self._drop_hint)
 
         browse = QPushButton("浏览…")
         browse.clicked.connect(self._browse)
@@ -138,6 +144,12 @@ class CertDialog(QDialog):
         if not certs.is_pair(cert, key):
             self._fail("私钥与证书不匹配，请确认拖入的是同一对文件")
             return
+        if self._target and set(cert.domains) != set(self._target.domains):
+            self._fail(
+                "域名与原证书不一致，替换要求域名完全相同\n"
+                f"原：{'，'.join(self._target.domains)}\n新：{'，'.join(cert.domains)}"
+            )
+            return
         self._cert_path, self._cert = cert_path, cert
         self._key_path, self._key = key_path, key
         self._show()
@@ -153,7 +165,11 @@ class CertDialog(QDialog):
         self.key_label.setText(key.kind)
         self.files_label.setText(f"{self._cert_path.name} ／ {self._key_path.name}")
         self.drop_area.setText(f"已识别 {cert.name}")
-        self.hint.setText("确认无误后点「保存」，两个文件会复制到证书库")
+        self.hint.setText(
+            "确认无误后点「保存」，两个文件会覆盖原证书"
+            if self._target
+            else "确认无误后点「保存」，两个文件会复制到证书库"
+        )
         self.hint.setStyleSheet("color:#6b7280;")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
 
@@ -163,7 +179,7 @@ class CertDialog(QDialog):
         self._cert = self._key = None
         for label in (self.domains_label, self.period_label, self.left_label, self.key_label, self.files_label):
             label.clear()
-        self.drop_area.setText(DROP_HINT)
+        self.drop_area.setText(self._drop_hint)
         self.hint.setText(reason)
         self.hint.setStyleSheet("color:#d9534f;")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
@@ -175,7 +191,7 @@ class CertDialog(QDialog):
             self._accept_files([Path(path) for path in paths])
 
     def _save(self) -> None:
-        """按主域名与短 id 重命名归档 文件内容原样保留"""
+        """新增按主域名与短 id 归档 替换沿用原 id 与文件名覆盖归档"""
         cert = Certificate(
             name=self._cert.name,
             domains=self._cert.domains,
@@ -184,7 +200,12 @@ class CertDialog(QDialog):
             key_type=self._key.kind,
         )
         try:
-            self._store.add_certificate(cert, self._cert_path, self._key_path)
+            if self._target:
+                cert.id = self._target.id
+                cert.cert_file, cert.key_file = self._target.cert_file, self._target.key_file
+                self._store.replace_certificate(cert, self._cert_path, self._key_path)
+            else:
+                self._store.add_certificate(cert, self._cert_path, self._key_path)
         except OSError as error:
             QMessageBox.warning(self, "保存失败", f"复制证书文件失败：{error}")
             return

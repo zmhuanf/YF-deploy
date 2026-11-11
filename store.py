@@ -56,13 +56,16 @@ class Server:
 
 @dataclass(slots=True)
 class Project:
-    """一次「上传本地目录 + 执行远程命令」的配置"""
+    """一次「上传本地目录 + 执行远程命令」的配置 可绑定证书用于远程更新"""
 
     name: str = ""
     server_id: str = ""
     local_path: str = ""
     remote_path: str = ""
     command: str = ""
+    cert_id: str = ""
+    cert_remote_path: str = ""
+    key_remote_path: str = ""
     id: str = ""
 
     def __post_init__(self) -> None:
@@ -206,6 +209,24 @@ class Store:
             raise
         cert.cert_file, cert.key_file = cert_path.name, key_path.name
         self.certificates.append(cert)
+        _dump(self.certs_file, self.certificates)
+
+    def replace_certificate(self, cert: Certificate, cert_source: Path, key_source: Path) -> None:
+        """覆盖已有证书的归档文件并更新记录 id 与文件名沿用原记录"""
+        cert_path, key_path = self.certs_dir / cert.cert_file, self.certs_dir / cert.key_file
+        tmp_cert = cert_path.with_name(cert_path.name + ".tmp")
+        tmp_key = key_path.with_name(key_path.name + ".tmp")
+        try:
+            # 先写临时文件再整体替换 复制中途失败不会损坏原归档
+            shutil.copyfile(cert_source, tmp_cert)
+            shutil.copyfile(key_source, tmp_key)
+            tmp_cert.replace(cert_path)
+            tmp_key.replace(key_path)
+        except OSError:
+            tmp_cert.unlink(missing_ok=True)
+            tmp_key.unlink(missing_ok=True)
+            raise
+        self._upsert(self.certificates, cert)
         _dump(self.certs_file, self.certificates)
 
     def remove_certificate(self, cert_id: str) -> None:
