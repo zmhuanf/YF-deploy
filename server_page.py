@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from card_view import ROLE_BADGE, ROLE_ICON, ROLE_KEY, ROLE_SUBTITLE, ROLE_TITLE, make_card_view
+from port_dialog import PortDialog
 from store import DEFAULT_PI_TEMPLATE, PI_PLACEHOLDERS, Server, Store, render_pi_command
 
 OS_LABELS = {"linux": "Linux", "windows": "Windows"}
@@ -209,7 +210,7 @@ class ServerPage(QWidget):
         super().__init__(parent)
         self.store = store
 
-        hint = QLabel("双击服务器进入文件管理；右键可新建、复制连接指令、编辑 pi 模板、删除")
+        hint = QLabel("双击服务器进入文件管理；右键可新建、复制连接指令、编辑 pi 模板、查看端口列表、删除")
         hint.setStyleSheet("color:#6b7280;padding:8px 12px;")
 
         self.view = make_card_view()
@@ -251,6 +252,8 @@ class ServerPage(QWidget):
             menu.addAction("复制 pi 启动指令").setData("pi")
             menu.addAction("编辑 pi 启动指令").setData("pi_edit")
             menu.addSeparator()
+            menu.addAction("查看端口列表").setData("ports")
+            menu.addSeparator()
             menu.addAction("编辑").setData("edit")
             menu.addAction("删除").setData("delete")
 
@@ -266,6 +269,8 @@ class ServerPage(QWidget):
                 self._copy(self.store.pi_command(server), "pi 启动指令已复制到剪贴板")
             case "pi_edit":
                 self._edit_pi_template(server)
+            case "ports":
+                PortDialog(self.store, server, self).exec()
             case "edit":
                 self._edit(server)
             case "delete":

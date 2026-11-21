@@ -91,6 +91,27 @@ class Certificate:
             self.id = uuid.uuid4().hex[:12]
 
 
+@dataclass(slots=True)
+class PortRecord:
+    """一台服务器上被记录的端口 由服务器与端口号唯一确定 备注非空时扫描不会删它"""
+
+    server_id: str = ""
+    port: int = 0
+    program: str = ""
+    path: str = ""
+    remark: str = ""
+    alive: bool = False
+
+
+@dataclass(slots=True)
+class ScannedPort:
+    """远端扫到的一个监听端口 程序名与路径取不到时为空"""
+
+    port: int = 0
+    program: str = ""
+    path: str = ""
+
+
 def render_pi_command(template: str, server: Server) -> str:
     """把服务器信息套进模板 认不出的占位符原样保留"""
     values = {
@@ -145,10 +166,12 @@ class Store:
         self.projects_file = root / "projects.json"
         self.certs_file = root / "certs.json"
         self.settings_file = root / "settings.json"
+        self.ports_file = root / "ports.json"
         self.certs_dir = certs_dir
         self.servers: list[Server] = _load(self.servers_file, Server)
         self.projects: list[Project] = _load(self.projects_file, Project)
         self.certificates: list[Certificate] = _load(self.certs_file, Certificate)
+        self.ports: list[PortRecord] = _load(self.ports_file, PortRecord)
         self.pi_template: str = _valid_template(_load_settings(self.settings_file).get("pi_template"))
 
     def server(self, server_id: str) -> Server | None:
@@ -183,14 +206,56 @@ class Store:
         _dump(self.projects_file, self.projects)
 
     def remove_server(self, server_id: str) -> None:
-        """删除服务器并落盘 引用它的项目保持原样"""
+        """删除服务器并落盘 它名下的端口记录一并清掉 引用它的项目保持原样"""
         self.servers = [item for item in self.servers if item.id != server_id]
         _dump(self.servers_file, self.servers)
+        self.ports = [item for item in self.ports if item.server_id != server_id]
+        _dump(self.ports_file, self.ports)
 
     def remove_project(self, project_id: str) -> None:
         """删除项目并落盘"""
         self.projects = [item for item in self.projects if item.id != project_id]
         _dump(self.projects_file, self.projects)
+
+    def ports_for(self, server_id: str) -> list[PortRecord]:
+        """这台服务器记录的端口 按端口号升序"""
+        return sorted((item for item in self.ports if item.server_id == server_id), key=lambda item: item.port)
+
+    def upsert_port(self, record: PortRecord) -> None:
+        """按 服务器+端口 覆盖保存 备注改动走这里"""
+        self.ports = [item for item in self.ports if (item.server_id, item.port) != (record.server_id, record.port)]
+        self.ports.append(record)
+        _dump(self.ports_file, self.ports)
+
+    def remove_port(self, server_id: str, port: int) -> None:
+        """删掉一条端口记录并落盘 不影响远端服务"""
+        self.ports = [item for item in self.ports if (item.server_id, item.port) != (server_id, port)]
+        _dump(self.ports_file, self.ports)
+
+    def apply_scan(self, server_id: str, listeners: dict[int, ScannedPort]) -> None:
+        """按扫描结果刷新这台服务器的端口记录 无备注且不再占用的记录丢弃 有备注的只标为已停止"""
+        kept = [item for item in self.ports if item.server_id != server_id]
+        for item in self.ports:
+            if item.server_id != server_id:
+                continue
+            scanned = listeners.get(item.port)
+            if scanned is not None:
+                item.alive = True
+                item.program = scanned.program or item.program
+                item.path = scanned.path or item.path
+            elif item.remark.strip():
+                item.alive = False
+            else:
+                continue
+            kept.append(item)
+        known = {item.port for item in kept if item.server_id == server_id}
+        kept.extend(
+            PortRecord(server_id=server_id, port=port, program=scanned.program, path=scanned.path, alive=True)
+            for port, scanned in sorted(listeners.items())
+            if port not in known
+        )
+        self.ports = kept
+        _dump(self.ports_file, self.ports)
 
     def add_certificate(self, cert: Certificate, cert_source: Path, key_source: Path) -> None:
         """复制证书与私钥进 certs 目录 文件名按主域名与 id 生成 后缀固定 crt 与 key"""
